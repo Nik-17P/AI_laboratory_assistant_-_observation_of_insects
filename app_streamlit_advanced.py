@@ -158,10 +158,18 @@ def safe_llm_call_with_fallback(prompt: str, provider_config: dict, timeout: int
         return f"⚠️ LLM временно недоступен. Базовая информация сохранена. Ошибка: {str(e)}"
 
 def test_camera_simple(camera_index):
-    """Простой тест камеры"""
+    """Простой тест камеры с пропуском кадров для прогрева"""
     print("Testing camera...")
     cap = cv2.VideoCapture(camera_index)
     if cap.isOpened():
+        # Пропускаем первые 5 кадров для стабилизации камеры
+        for i in range(5):
+            ret, _ = cap.read()
+            if not ret:
+                break
+            # Небольшая задержка между кадрами для прогрева
+            time.sleep(0.1)
+        
         ret, frame = cap.read()
         if ret:
             print("✓ Camera works")
@@ -176,14 +184,25 @@ def test_camera_simple(camera_index):
         print("✗ Camera not accessible")
         return False, None
 
-def capture_frame(camera_index):
-    """Просто захватить один кадр с камеры"""
+def capture_frame(camera_index, skip_frames=5):
+    """Захватить один кадр с камеры с пропуском первых N кадров для прогрева"""
     cap = cv2.VideoCapture(camera_index)
-    if cap.isOpened():
-        ret, frame = cap.read()
-        cap.release()
-        if ret:
-            return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if not cap.isOpened():
+        return None
+    
+    # Пропускаем первые N кадров для стабилизации камеры
+    for i in range(skip_frames):
+        ret, _ = cap.read()
+        if not ret:
+            break
+        # Небольшая задержка между кадрами для прогрева
+        time.sleep(0.1)
+    
+    # Захватываем "настоящий" кадр
+    ret, frame = cap.read()
+    cap.release()
+    if ret:
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     return None
 
 def initialize_detectors():
@@ -218,8 +237,8 @@ def camera_worker_simple():
     
     while CAM_RUNNING:
         try:
-            # Захватываем один кадр
-            current_frame = capture_frame(st.session_state.camera_index)
+            # Захватываем один кадр (для реального времени используем без пропуска кадров для лучшей производительности)
+            current_frame = capture_frame(st.session_state.camera_index, skip_frames=0)
             
             if current_frame is not None:
                 with CAM_LOCK:
@@ -338,8 +357,11 @@ def stop_camera_thread():
 def manual_capture_event(description=""):
     """Создать событие вручную с текущим кадром"""
     try:
-        # Захватываем кадр
-        frame = capture_frame(st.session_state.camera_index)
+        # Показываем индикатор прогрева
+        st.info("🔥 Камера прогревается...")
+        
+        # Захватываем кадр с пропуском кадров для прогрева
+        frame = capture_frame(st.session_state.camera_index, skip_frames=5)
         if frame is None:
             st.error("❌ Не удалось сделать снимок")
             return False
@@ -376,7 +398,20 @@ def manual_capture_event(description=""):
         5. Научные выводы и рекомендации по дальнейшему наблюдению
         """
         
-        report = safe_llm_call_with_fallback(prompt, provider_config, timeout=300)
+        # Используем стриминг для анализа изображения
+        if provider_config["type"] == "Ollama":
+            # Создаем placeholder для отображения стриминга
+            analysis_placeholder = st.empty()
+            with st.spinner("🔍 Анализируем изображение..."):
+                report = stream_ollama_response_with_image_to_streamlit(
+                    prompt, 
+                    img_path, 
+                    provider_config["url"], 
+                    provider_config["model"],
+                    analysis_placeholder
+                )
+        else:
+            report = safe_llm_call_with_fallback(prompt, provider_config, timeout=300)
         
         # Добавляем событие в базу
         st.session_state.mem.add_event(
@@ -407,19 +442,29 @@ def auto_capture_worker():
     AUTO_CAPTURE_RUNNING = True
     print("🚀 Автоматическая фиксация запущена")
     
-    provider_config = get_current_provider_config()
+    # Получаем конфигурацию провайдера один раз при старте потока
+    provider_config = get_provider_config(
+        st.session_state.llm_provider_type,
+        st.session_state.ollama_url,
+        st.session_state.ollama_model,
+        st.session_state.lm_studio_url,
+        st.session_state.lm_studio_model
+    )
     
     while AUTO_CAPTURE_RUNNING and st.session_state.auto_capture_enabled:
         current_time = time.time()
         
         if current_time - st.session_state.last_auto_capture >= st.session_state.auto_capture_interval:
-            # Захватываем один кадр для автофиксации
-            frame = capture_frame(st.session_state.camera_index)
+            # Захватываем один кадр для автофиксации с пропуском кадров для прогрева
+            frame = capture_frame(st.session_state.camera_index, skip_frames=5)
             if frame is not None:
                 try:
                     ts = int(current_time * 1000)
                     img_path = f"frames/auto_capture_{ts}.jpg"
                     Image.fromarray(frame).save(img_path)
+                    
+                    # Добавляем задержку в 5 секунд перед анализом, чтобы избежать черных кадров
+                    time.sleep(5)
                     
                     # Анализируем сцену
                     prompt = f"""
@@ -437,7 +482,16 @@ def auto_capture_worker():
                     - Рекомендации по корректировке наблюдений
                     """
                     
-                    report = safe_llm_call_with_fallback(prompt, provider_config, timeout=300)
+                    # Используем стриминг для анализа изображения
+                    if provider_config["type"] == "Ollama":
+                        report = stream_ollama_response_with_image(
+                            prompt, 
+                            img_path, 
+                            provider_config["url"], 
+                            provider_config["model"]
+                        )
+                    else:
+                        report = safe_llm_call_with_fallback(prompt, provider_config, timeout=300)
                     
                     st.session_state.mem.add_event(
                         type_="auto_capture", 
@@ -481,6 +535,98 @@ def stop_auto_capture():
     AUTO_CAPTURE_RUNNING = False
 
 
+
+def encode_image(image_path):
+    """Кодировать изображение в base64"""
+    with open(image_path, "rb") as image_file:
+        return base64.b64encode(image_file.read()).decode('utf-8')
+
+def stream_ollama_response_with_image(prompt, image_path, ollama_url, model):
+    """Стриминг ответа Ollama с анализом изображения"""
+    import requests
+    import json
+    
+    url = f"{ollama_url.rstrip('/')}/api/generate"
+    
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "images": [encode_image(image_path)],
+        "stream": True
+    }
+    
+    response = requests.post(url, json=payload, stream=True)
+    
+    if response.status_code == 200:
+        full_response = ""
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line.decode('utf-8'))
+                    chunk = data.get("response", "")
+                    
+                    # Возвращаем чанк для отображения в Streamlit
+                    full_response += chunk
+                    
+                    if data.get("done", False):
+                        break
+                        
+                except json.JSONDecodeError:
+                    print(f"Ошибка декодирования JSON: {line}")
+        return full_response
+    else:
+        print(f"Ошибка: {response.status_code}")
+        print(response.text)
+        return f"Ошибка API: {response.status_code} - {response.text}"
+
+def stream_ollama_response_with_image_to_streamlit(prompt, image_path, ollama_url, model, placeholder=None):
+    """Стриминг ответа Ollama с анализом изображения с отображением в Streamlit"""
+    import requests
+    import json
+    
+    url = f"{ollama_url.rstrip('/')}/api/generate"
+    
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "images": [encode_image(image_path)],
+        "stream": True
+    }
+    
+    response = requests.post(url, json=payload, stream=True)
+    
+    if response.status_code == 200:
+        full_response = ""
+        if placeholder:
+            placeholder.empty()  # Очищаем placeholder перед началом стриминга
+        
+        for line in response.iter_lines():
+            if line:
+                try:
+                    data = json.loads(line.decode('utf-8'))
+                    chunk = data.get("response", "")
+                    
+                    # Обновляем полный ответ
+                    full_response += chunk
+                    
+                    # Если есть placeholder, обновляем его содержимое
+                    if placeholder:
+                        with placeholder:
+                            st.markdown(full_response)
+                    
+                    if data.get("done", False):
+                        break
+                        
+                except json.JSONDecodeError:
+                    print(f"Ошибка декодирования JSON: {line}")
+        return full_response
+    else:
+        print(f"Ошибка: {response.status_code}")
+        print(response.text)
+        error_msg = f"Ошибка API: {response.status_code} - {response.text}"
+        if placeholder:
+            placeholder.error(error_msg)
+        return error_msg
 
 def analyze_image_with_ollama(prompt: str, image_base64: str, ollama_url: str, model: str, timeout: int = 300):
     """Специальная функция для анализа изображений через Ollama с поддержкой vision моделей"""
@@ -707,6 +853,18 @@ with st.sidebar:
             st.info(f"Следующая фиксация через: {hours}ч {minutes}м")
         else:
             st.info("Первая фиксация скоро начнется")
+        
+        # Кнопка для ручной остановки авто-фиксации
+        if st.button("⏹️ Остановить авто-фиксацию", type="secondary", use_container_width=True):
+            st.session_state.auto_capture_enabled = False
+            stop_auto_capture()
+            st.rerun()
+    else:
+        # Добавляем кнопку запуска авто-фиксации для удобства
+        if st.button("▶️ Запустить авто-фиксацию", type="primary", use_container_width=True):
+            st.session_state.auto_capture_enabled = True
+            start_auto_capture()
+            st.rerun()
     
     st.markdown("---")
     
@@ -873,8 +1031,8 @@ with tabs[0]:
         stats_data = {
             "Метрика": ["Событий в памяти", "Детекций сейчас", "Авто-фиксация", "Камера", "YOLO детектор"],
             "Значение": [
-                len(st.session_state.mem.recent(1000)),
-                len(DETECTIONS),
+                str(len(st.session_state.mem.recent(1000))),
+                str(len(DETECTIONS)),
                 "🟢 Вкл" if AUTO_CAPTURE_RUNNING else "🔴 Выкл",
                 "🟢 Активна" if CAM_RUNNING else "🔴 Выкл",
                 "🟢 Готов" if VISION_DETECTOR else "🔴 Выкл"
