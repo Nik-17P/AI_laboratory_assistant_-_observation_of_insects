@@ -442,7 +442,14 @@ def auto_capture_worker():
     AUTO_CAPTURE_RUNNING = True
     print("🚀 Автоматическая фиксация запущена")
     
-    provider_config = get_current_provider_config()
+    # Получаем конфигурацию провайдера один раз при старте потока
+    provider_config = get_provider_config(
+        st.session_state.llm_provider_type,
+        st.session_state.ollama_url,
+        st.session_state.ollama_model,
+        st.session_state.lm_studio_url,
+        st.session_state.lm_studio_model
+    )
     
     while AUTO_CAPTURE_RUNNING and st.session_state.auto_capture_enabled:
         current_time = time.time()
@@ -1024,8 +1031,8 @@ with tabs[0]:
         stats_data = {
             "Метрика": ["Событий в памяти", "Детекций сейчас", "Авто-фиксация", "Камера", "YOLO детектор"],
             "Значение": [
-                len(st.session_state.mem.recent(1000)),
-                len(DETECTIONS),
+                str(len(st.session_state.mem.recent(1000))),
+                str(len(DETECTIONS)),
                 "🟢 Вкл" if AUTO_CAPTURE_RUNNING else "🔴 Выкл",
                 "🟢 Активна" if CAM_RUNNING else "🔴 Выкл",
                 "🟢 Готов" if VISION_DETECTOR else "🔴 Выкл"
